@@ -169,6 +169,23 @@ class FactorGraphBackend {
   };
   SmartFactorHealth smartFactorHealth() const;
 
+  // --- LOOP CLOSURE ICIN: bir keyframe'in KENDI gozlemledigi track'lerden,
+  // SU AN (bu cagrildigi anda, keyframe hala TAZEYKEN) GECERLI (triangulate
+  // edilebilmis) 3D dunya konumuna sahip olanlarin ANLIK GORUNTUSUNU (snapshot)
+  // dondurur. Bu SNAPSHOT alinip KeyframeDatabase'e KALICI olarak kaydedilmelidir
+  // - cunku bu keyframe ileride sliding window'dan marginalize olup smoother'in
+  // canli tahmininden (`calculateEstimate()`) DUSECEK, o zaman bu bilgiye bir
+  // daha ERISILEMEZ (bkz. smartFactorHealth()'teki ayni "all_keys_present"
+  // guvenlik kontrolu - marginalize edilmis bir factor'un point() cagrisi
+  // ValuesKeyDoesNotExist firlatir).
+  struct LandmarkSnapshot {
+    int track_id = -1;
+    cv::Point2f pixel;      // bu keyframedeki HAM (distorsiyonu giderilmemis) piksel gozlemi
+    gtsam::Point3 point_w;  // o anki tahmini dunya-cercevesi 3D konumu
+  };
+  std::vector<LandmarkSnapshot> snapshotValidLandmarks(
+      int keyframe_id, const std::unordered_map<int, cv::Point2f>& observations) const;
+
  private:
   using SmartFactor = gtsam::SmartProjectionPoseFactor<gtsam::Cal3_S2>;
 

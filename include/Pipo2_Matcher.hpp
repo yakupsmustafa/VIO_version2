@@ -71,6 +71,16 @@ class OrbMatcher {
                                  const std::vector<cv::KeyPoint>& kpts2, const cv::Mat& desc2,
                                  const PinholeCameraModel& camera) const;
 
+  // match()'in SADECE ilk 2 asamasi (oran testi + simetrik/karsilikli kontrol) -
+  // 3. asama (RANSAC + Essential Matrix) UYGULANMAZ. Loop closure gibi iki
+  // kare arasinda KEYFI BUYUK bir poz farki olabilecek (Essential Matrix'in
+  // guvenilir calismayabilecegi) VE geometrik dogrulamanin BASKA bir yontemle
+  // (orn. PnP-RANSAC, 3D-2D karsilik biliniyorsa) yapilacagi durumlar icin.
+  // NOT: match() bu fonksiyonu KULLANMAZ, birbirinden BAGIMSIZDIR - bu yuzden
+  // match()'in mevcut davranisi/cagiranlari HICBIR SEKILDE etkilenmez.
+  std::vector<cv::DMatch> matchRaw(const std::vector<cv::KeyPoint>& kpts1, const cv::Mat& desc1,
+                                    const std::vector<cv::KeyPoint>& kpts2, const cv::Mat& desc2) const;
+
  private:
   // query_desc'teki her tanimlayici icin train_desc icinde en yakin 2 komsuyu
   // bulur ve oran testini uygular. Donen eslesmelerde queryIdx=query_desc,

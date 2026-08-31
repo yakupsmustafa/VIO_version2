@@ -44,6 +44,9 @@ add_executable(drone_vio
   src/GtAligner.cpp
   src/AteEvaluator.cpp
   src/Visualizer.cpp
+  src/KeyframeDatabase.cpp
+  src/LoopClosureDetector.cpp
+  src/PoseGraphOptimizer.cpp
 )
 
 target_include_directories(drone_vio PRIVATE

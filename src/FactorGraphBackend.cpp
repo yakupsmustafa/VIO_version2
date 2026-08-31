@@ -407,6 +407,39 @@ FactorGraphBackend::SmartFactorHealth FactorGraphBackend::smartFactorHealth() co
   return health;
 }
 
+std::vector<FactorGraphBackend::LandmarkSnapshot> FactorGraphBackend::snapshotValidLandmarks(
+    int keyframe_id, const std::unordered_map<int, cv::Point2f>& observations) const {
+  (void)keyframe_id;  // su an sadece log/gelecekteki kullanim icin saklaniyor
+  std::vector<LandmarkSnapshot> result;
+  const gtsam::Values estimate = smoother_.calculateEstimate();
+
+  for (const auto& kv : observations) {
+    const int track_id = kv.first;
+    const auto factor_it = smart_factors_.find(track_id);
+    if (factor_it == smart_factors_.end()) continue;
+
+    const SmartFactor::shared_ptr& factor = factor_it->second;
+    bool all_keys_present = true;
+    for (const gtsam::Key& key : factor->keys()) {
+      if (!estimate.exists(key)) {
+        all_keys_present = false;
+        break;
+      }
+    }
+    if (!all_keys_present) continue;
+
+    const gtsam::TriangulationResult tri = factor->point(estimate);
+    if (!tri.valid()) continue;
+
+    LandmarkSnapshot snap;
+    snap.track_id = track_id;
+    snap.pixel = kv.second;
+    snap.point_w = *tri;
+    result.push_back(snap);
+  }
+  return result;
+}
+
 gtsam::Pose3 FactorGraphBackend::poseAt(int keyframe_id) const {
   auto it = pose_history_.find(keyframe_id);
   if (it != pose_history_.end()) {

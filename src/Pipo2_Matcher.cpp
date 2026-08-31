@@ -99,4 +99,32 @@ std::vector<cv::DMatch> OrbMatcher::match(const std::vector<cv::KeyPoint>& kpts1
   return inlier_matches;
 }
 
+std::vector<cv::DMatch> OrbMatcher::matchRaw(const std::vector<cv::KeyPoint>& kpts1, const cv::Mat& desc1,
+                                              const std::vector<cv::KeyPoint>& kpts2, const cv::Mat& desc2) const {
+  (void)kpts1;
+  (void)kpts2;
+  // match()'teki AYNI 2 adim (oran testi + simetrik kontrol) - sadece 3.
+  // adimi (RANSAC+Essential Matrix) atliyoruz. kpts1/kpts2 parametreleri
+  // bu asamada kullanilmiyor (sadece DMatch indeksleri donuyor) ama arayuzu
+  // match() ile tutarli/simetrik tutmak icin alindi.
+  const std::vector<cv::DMatch> forward = ratioTestMatch(desc1, desc2);
+  const std::vector<cv::DMatch> backward = ratioTestMatch(desc2, desc1);
+
+  std::unordered_map<int, int> backward_map;
+  backward_map.reserve(backward.size());
+  for (const auto& bm : backward) {
+    backward_map[bm.queryIdx] = bm.trainIdx;
+  }
+
+  std::vector<cv::DMatch> symmetric_matches;
+  symmetric_matches.reserve(forward.size());
+  for (const auto& fm : forward) {
+    auto it = backward_map.find(fm.trainIdx);
+    if (it != backward_map.end() && it->second == fm.queryIdx) {
+      symmetric_matches.push_back(fm);
+    }
+  }
+  return symmetric_matches;
+}
+
 }  // namespace vio

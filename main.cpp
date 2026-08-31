@@ -8,9 +8,15 @@
 //   4) Devam eden karelerden gelen YENI keyframe'ler addKeyframe() ile
 //      tek tek islenir (iSAM2/IncrementalFixedLagSmoother ile artimli
 //      optimizasyon, sliding window marginalization)
-//   5) HER kare icin: kamera penceresi (ORB noktalari + FPS) ve trajectory
+//   5) HER keyframe icin AYRICA: KeyframeDatabase'e (tam ORB verisi + gecerli
+//      3D landmark anlik goruntusu) kaydedilir, PoseGraphOptimizer'e eklenir,
+//      ve LoopClosureDetector ile "daha once buradan gectim mi" kontrolu
+//      yapilir - bulunursa PoseGraphOptimizer TUM gecmis trajectory'yi
+//      (FactorGraphBackend'in marginalize edip donduddugu eskiler DAHIL)
+//      yeniden hizalar (bkz. PoseGraphOptimizer.hpp).
+//   6) HER kare icin: kamera penceresi (ORB noktalari + FPS) ve trajectory
 //      penceresi (VIO vs GT, renkli+lejantli+FPS) guncellenir
-//   6) Program sonunda (veya 'q' ile cikildiginda) GtAligner+AteEvaluator ile
+//   7) Program sonunda (veya 'q' ile cikildiginda) GtAligner+AteEvaluator ile
 //      NIHAI ATE (Absolute Trajectory Error) hesaplanip yazdirilir.
 //
 // GT (ground truth), tanimi geregi SADECE gorsellestirme ve ATE degerlendirme
@@ -30,18 +36,23 @@
 #include "FeatureTracker.hpp"
 #include "FpsCounter.hpp"
 #include "GtAligner.hpp"
+#include "KeyframeDatabase.hpp"
+#include "LoopClosureDetector.hpp"
+#include "PoseGraphOptimizer.hpp"
 #include "VioInitializer.hpp"
 #include "Visualizer.hpp"
 
 namespace {
 
 // Su ana kadar biriken VIO/GT trajectory'lerini gunceller: yeni keyframe'in
-// VIO pozunu ve (varsa) en yakin GT pozunu listelere ekler. GT SADECE
-// gorsellestirme icindir, kestirime asla girdi olarak verilmez.
-void appendTrajectoryPoint(const vio::FactorGraphBackend& backend, const vio::EurocDataLoader& loader, int keyframe_id,
-                            vio::TimestampNs timestamp_ns, std::vector<vio::TimestampNs>& vio_timestamps,
-                            std::vector<Eigen::Vector3d>& vio_positions, std::vector<Eigen::Vector3d>& gt_positions_vis) {
-  const gtsam::Pose3 pose = backend.poseAt(keyframe_id);
+// (loop-closure ile DUZELTILMIS) pozunu ve (varsa) en yakin GT pozunu
+// listelere ekler. GT SADECE gorsellestirme icindir, kestirime asla girdi
+// olarak verilmez. NOT: pose parametresi disaridan verilir (backend.poseAt()
+// veya poseGraph.correctedPoseAt() olabilir) - bu fonksiyon kaynagi bilmez,
+// sadece verilen pozu trajectory'ye ekler.
+void appendTrajectoryPoint(const gtsam::Pose3& pose, const vio::EurocDataLoader& loader, vio::TimestampNs timestamp_ns,
+                            std::vector<vio::TimestampNs>& vio_timestamps, std::vector<Eigen::Vector3d>& vio_positions,
+                            std::vector<Eigen::Vector3d>& gt_positions_vis) {
   vio_timestamps.push_back(timestamp_ns);
   vio_positions.push_back(pose.translation());
 
@@ -54,6 +65,20 @@ void appendTrajectoryPoint(const vio::FactorGraphBackend& backend, const vio::Eu
 // Su ana kadarki VIO trajectory'sini GT ile hizalayip CANLI ATE/scale
 // hesaplar (trajectory penceresinin ustune yazdirmak icin - kullanicinin
 // talebi). Yeterli eslesen GT noktasi yoksa metrics.valid=false doner.
+// Bir loop-closure olayindan SONRA cagirilir: PoseGraphOptimizer, GECMISTEKI
+// keyframe pozlarini da (marginalize/donmus olanlar dahil) DUZELTMIS olabilir
+// - appendTrajectoryPoint zamaninda tek-seferlik eklenen vio_positions
+// degerleri bu duzeltmeyi KENDILIGINDEN yansitmaz (bir daha dokunulmazlar).
+// Bu yuzden loop closure sonrasi, TUM gecmis noktalari pose_graph'tan
+// YENIDEN cekip vio_positions'i tazeliyoruz - aksi halde gorsellestirme VE
+// nihai ATE, loop closure'in asil faydasini (gecmisi duzeltme) GOSTEREMEZDI.
+void refreshTrajectoryFromPoseGraph(const vio::PoseGraphOptimizer& pose_graph, const std::vector<int>& vio_keyframe_ids,
+                                     std::vector<Eigen::Vector3d>& vio_positions) {
+  for (std::size_t i = 0; i < vio_keyframe_ids.size(); ++i) {
+    vio_positions[i] = pose_graph.correctedPoseAt(vio_keyframe_ids[i]).translation();
+  }
+}
+
 vio::LiveMetrics computeLiveMetrics(const std::vector<vio::TimestampNs>& vio_timestamps,
                                      const std::vector<Eigen::Vector3d>& vio_positions,
                                      const vio::EurocDataLoader& loader) {
@@ -91,6 +116,10 @@ int main(int argc, char** argv) {
   const vio::TimestampNs first_gt_ts = loader.groundTruth().front().timestamp_ns;
 
   std::vector<vio::KeyframeObservation> window;
+  // Baslangic penceresindeki her keyframe'in TAM ORB verisi (KeyframeDatabase
+  // icin) - window ile AYNI sirada/indekste tutulur. landmarks alani, backend
+  // kurulduktan SONRA doldurulacak (o ana kadar hicbir SmartFactor yok).
+  std::vector<vio::KeyframeRecord> bootstrap_records;
   const int target_window_size = 10;
 
   std::size_t frame_idx = 0;
@@ -108,6 +137,14 @@ int main(int argc, char** argv) {
       obs.keyframe_id = static_cast<int>(window.size());
       obs.timestamp_ns = cam[frame_idx].timestamp_ns;
       for (const auto& kv : tracker.activeTracks()) obs.observations[kv.first] = kv.second.current_pixel;
+
+      vio::KeyframeRecord record;
+      record.keyframe_id = obs.keyframe_id;
+      record.timestamp_ns = obs.timestamp_ns;
+      record.keypoints = tracker.currentKeypoints();
+      record.descriptors = tracker.currentDescriptors().clone();  // clone SART: bir sonraki karede yeniden yazilir
+      bootstrap_records.push_back(std::move(record));
+
       window.push_back(std::move(obs));
     }
   }
@@ -164,13 +201,48 @@ int main(int argc, char** argv) {
   vio::FactorGraphBackend backend(camera, loader.imuCalibration());
   backend.initializeWithWindow(window, imu_between_keyframes, init_result);
 
+  // --- Loop closure katmani: FactorGraphBackend'e HIC dokunmayan, ondan
+  // BAGIMSIZ/PARALEL calisan ayri modulller (bkz. proje hafizasi - "gec-donem
+  // kayma" arastirmasi ve onaylanan tasarim). ---
+  vio::KeyframeDatabase kf_database;
+  vio::PoseGraphOptimizer pose_graph;
+  vio::LoopClosureDetector loop_detector(camera);
+  int loop_closure_count = 0;
+
+  // ONEMLI (deneyerek kesfedildi): en pahali islem, loop-closure ARAMASI
+  // degil, HER keyframe'de FactorGraphBackend::snapshotValidLandmarks()
+  // cagirmanin kendisiydi (o keyframe'in TUM gozlemlerini yeniden triangule
+  // ediyor) - bu "her zaman acik" maliyet, throttle'lanan aramadan bile daha
+  // fazla FPS dusuruyordu. Bu yuzden hem KeyframeDatabase'e KAYIT hem de
+  // loop-closure DENEMESI, TEK bir ortak "her N keyframe'de bir" araligiyla
+  // sinirlaniyor (PoseGraphOptimizer'a odometry EKLEME ise HER keyframe'de
+  // devam ediyor - bu ucuz ve BetweenFactor zincirinin kesintisiz kalmasi
+  // icin gerekli).
+  const int loop_closure_interval_keyframes = 5;
+  int keyframes_since_last_db_store = 0;
+
+  // Baslangic penceresindeki her keyframe'i loop-closure katmanina da ekle
+  // (henuz aday olamayacak kadar az/yeni olduklari icin detect() burada
+  // CAGRILMIYOR - min_keyframe_gap zaten bunlari dogal olarak eleyecekti).
+  for (std::size_t i = 0; i < window.size(); ++i) {
+    const vio::KeyframeObservation& kf = window[i];
+    vio::KeyframeRecord record = bootstrap_records[i];
+    record.landmarks = backend.snapshotValidLandmarks(kf.keyframe_id, kf.observations);
+    kf_database.add(record);
+    pose_graph.addKeyframe(kf.keyframe_id, backend.poseAt(kf.keyframe_id));
+  }
+
   // --- Trajectory gecmisi (gorsellestirme + nihai ATE icin) ---
   std::vector<vio::TimestampNs> vio_timestamps;
   std::vector<Eigen::Vector3d> vio_positions;
   std::vector<Eigen::Vector3d> gt_positions_vis;  // SADECE gorsellestirme icin, kestirime GIRMEZ
+  // vio_positions[i]'nin HANGI keyframe_id'ye ait oldugu - loop closure
+  // sonrasi refreshTrajectoryFromPoseGraph() icin gerekli (bkz. yukarida).
+  std::vector<int> vio_keyframe_ids;
   for (const auto& kf : window) {
-    appendTrajectoryPoint(backend, loader, kf.keyframe_id, kf.timestamp_ns, vio_timestamps, vio_positions,
-                          gt_positions_vis);
+    appendTrajectoryPoint(pose_graph.correctedPoseAt(kf.keyframe_id), loader, kf.timestamp_ns, vio_timestamps,
+                          vio_positions, gt_positions_vis);
+    vio_keyframe_ids.push_back(kf.keyframe_id);
   }
 
   int next_keyframe_id = static_cast<int>(window.size());
@@ -202,8 +274,39 @@ int main(int argc, char** argv) {
         break;
       }
 
-      appendTrajectoryPoint(backend, loader, obs.keyframe_id, obs.timestamp_ns, vio_timestamps, vio_positions,
-                            gt_positions_vis);
+      // --- Loop closure katmani: pose-graph'a HER keyframe'de odometry
+      // ekle (ucuz), ama pahali KeyframeDatabase kaydi + tespit denemesini
+      // SADECE her loop_closure_interval_keyframes'te bir yap (bkz. yukaridaki aciklama).
+      pose_graph.addKeyframe(obs.keyframe_id, backend.poseAt(obs.keyframe_id));
+
+      ++keyframes_since_last_db_store;
+      if (keyframes_since_last_db_store >= loop_closure_interval_keyframes) {
+        keyframes_since_last_db_store = 0;
+
+        vio::KeyframeRecord record;
+        record.keyframe_id = obs.keyframe_id;
+        record.timestamp_ns = obs.timestamp_ns;
+        record.keypoints = tracker.currentKeypoints();
+        record.descriptors = tracker.currentDescriptors().clone();
+        record.landmarks = backend.snapshotValidLandmarks(obs.keyframe_id, obs.observations);
+        kf_database.add(record);
+
+        const vio::LoopClosureResult loop_result = loop_detector.detect(record, kf_database);
+        if (loop_result.found) {
+          pose_graph.addLoopClosure(loop_result.old_keyframe_id, loop_result.new_keyframe_id, loop_result.T_world_new);
+          ++loop_closure_count;
+          std::cout << "\n[LOOP CLOSURE] keyframe " << loop_result.new_keyframe_id << " <-> "
+                    << loop_result.old_keyframe_id << " (inlier=" << loop_result.num_inliers
+                    << ", toplam loop closure=" << loop_closure_count << ")\n";
+          // Gecmis TUM trajectory noktalarini duzeltilmis pozlarla tazele
+          // (bkz. refreshTrajectoryFromPoseGraph aciklamasi).
+          refreshTrajectoryFromPoseGraph(pose_graph, vio_keyframe_ids, vio_positions);
+        }
+      }
+
+      appendTrajectoryPoint(pose_graph.correctedPoseAt(obs.keyframe_id), loader, obs.timestamp_ns, vio_timestamps,
+                            vio_positions, gt_positions_vis);
+      vio_keyframe_ids.push_back(obs.keyframe_id);
       // Canli ATE/scale'i HER keyframe'de tazele (Umeyama SVD'si ucuz - bu,
       // FPS'i hissedilir sekilde etkilemez) - trajectory penceresinin
       // ustunde anlik takip icin (kullanicinin talebi).
@@ -219,7 +322,8 @@ int main(int argc, char** argv) {
                   << " scale=" << live_metrics.umeyama_scale
                   << " [TANI] gecerli_track=" << health.valid << "/" << health.total
                   << " (degenerate=" << health.degenerate << " arkada=" << health.behind_camera
-                  << " uzak=" << health.far_point << " aykiri=" << health.outlier << ")" << std::endl;
+                  << " uzak=" << health.far_point << " aykiri=" << health.outlier << ")"
+                  << " loop_closure=" << loop_closure_count << std::endl;
       }
     }
 
