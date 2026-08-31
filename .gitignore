@@ -1,0 +1,14 @@
+# Build çıktıları
+/build/
+
+# Üçüncü parti bağımlılıklar (GTSAM kaynak + kurulum) - kullanıcı kendi
+# makinesinde ayrı kurmalı, bkz. README
+/third_party/
+
+# Veri seti (büyük, ayrıca indirilmeli)
+/data/
+*.zip
+
+# Editör/IDE
+.vscode/
+*.swp
